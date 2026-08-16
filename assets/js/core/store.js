@@ -26,9 +26,12 @@
     T,
 
     // ===== 用户 profiles =====
-    async getUsers() { return X.dbq.select(T.PROFILES, { order: ['created_at', { ascending: true }] }); },
-    async getUser(id) { return X.dbq.select(T.PROFILES, { eq: ['id', id], single: true }); },
-    async getUserByName(name) { return X.dbq.select(T.PROFILES, { eq: ['username', name], single: true }); },
+    // [FIX: 401 profiles 静默吞] 未登录 / 匿名态查询 profiles 会 401 RLS 拒绝，
+    // 这里统一 catch 静默返回空，避免控制台刷屏。最小侵入，不改调用方逻辑。
+    async getUsers() { try { return await X.dbq.select(T.PROFILES, { order: ['created_at', { ascending: true }] }); } catch (_) { return []; } },
+    async getUser(id) { if (!id) return null; try { return await X.dbq.select(T.PROFILES, { eq: ['id', id], single: true }); } catch (_) { return null; } },
+    // [FIX: 401 profiles 静默吞]
+    async getUserByName(name) { if (!name) return null; try { return await X.dbq.select(T.PROFILES, { eq: ['username', name], single: true }); } catch (_) { return null; } },
     async saveUser(user) {
       // 仅更新可写字段（id 由 auth 决定）
       return X.dbq.upsert(T.PROFILES, user, { conflict: 'id' });
