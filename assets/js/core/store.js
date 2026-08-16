@@ -126,14 +126,24 @@
     });
   }
 
-  /** [前端 → DB] 大厅消息写入 public_chat */
+  /** [前端 → DB] 大厅消息写入 public_chat
+   *  注意：public_chat 表除了 sender_id/content/emojis/created_at，必须还有作者快照列，
+   *       否则渲染时无法显示名字/头像，出现"幽灵消息"。
+   *       如果你的 DB 还没补这几列，先跑一下配套的 ALTER TABLE SQL（见文档）。
+   *       我们兼容两种情况：列不存在时 PostgREST 会返回 400 → 调用方再退化成仅写 4 列。
+   */
   function _msgOut(fe) {
-    return {
+    const row = {
       sender_id: fe.user_id || fe.sender_id,
       content:   fe.text || fe.content || '',
       emojis:    fe.emojis || [],
       created_at: fe.created_at || new Date().toISOString()
     };
+    // 作者快照（public_chat 表补了这 3 列才会落盘生效，未补列不抛错：调用方会降级）
+    if (fe.username !== undefined)    row.username    = fe.username;
+    if (fe.avatar !== undefined)      row.avatar      = fe.avatar;
+    if (fe.avatar_type !== undefined) row.avatar_type = fe.avatar_type;
+    return row;
   }
 
   /** [DB → 前端] 私聊 private_chat_msg → dm_messages */
@@ -419,13 +429,62 @@
     async getChat(limit = 100) {
       try {
         const rows = await X.dbq.select(T.MESSAGES, { order: ['created_at', { ascending: true }], limit });
+        // 为缺作者快照列的旧消息/列缺失场景，根据 sender_id 从 profiles 补名字/头像
+        // （一次性按 id 去重批量取，不会 N+1 爆请求）
+        const senderIds = new Set();
+        (rows || []).forEach(r => {
+          if (r && !r.username && (r.sender_id || r.user_id)) senderIds.add(r.sender_id || r.user_id);
+        });
+        if (senderIds.size > 0) {
+          try {
+            // Supabase-js v2 直接连 client 发 `in` 查询，绕过 dbq 没封装 in() 的问题
+            const ids = Array.from(senderIds);
+            const { data, error } = await X.db
+              .from(T.PROFILES)
+              .select('id,username,avatar,avatar_url,avatar_type')
+              .in('id', ids);
+            if (!error && Array.isArray(data)) {
+              const map = {};
+              data.forEach(p => { map[p.id] = p; });
+              (rows || []).forEach(r => {
+                const sid = r.sender_id || r.user_id;
+                const p = map[sid];
+                if (p && !r.username) {
+                  r.username    = p.username || '';
+                  r.avatar      = p.avatar || p.avatar_url || '';
+                  r.avatar_type = p.avatar_type || (r.avatar && r.avatar.startsWith && r.avatar.startsWith('data:') ? 'dataurl' : 'emoji');
+                }
+              });
+            }
+          } catch (_) { /* 补不到就算了，渲染侧兜底显示 ❓ */ }
+        }
         return (rows || []).map(_msgIn);
       } catch (_) { return []; }
     },
     async addMessage({ userId, username, avatar, avatarType, text }) {
-      return _msgIn(await X.dbq.insert(T.MESSAGES, _msgOut({
-        user_id: userId, username, avatar, avatar_type: avatarType, text
-      })));
+      const payload = _msgOut({ user_id: userId, username, avatar, avatar_type: avatarType, text });
+      // 先尝试带作者快照 3 列写入（DB 补了列的情况下，渲染直接显示名字/头像）
+      try {
+        return _msgIn(await X.dbq.insert(T.MESSAGES, payload));
+      } catch (e1) {
+        // 列不存在时（PG 42703 → HTTP 400）：降级写基础 4 列 + JOIN profiles 拉作者信息兜底
+        const slim = {
+          sender_id: payload.sender_id,
+          content: payload.content,
+          emojis: payload.emojis,
+          created_at: payload.created_at
+        };
+        try {
+          const inserted = await X.dbq.insert(T.MESSAGES, slim);
+          // 合并作者信息，返回给前端渲染，让发送方当场看到名字/头像
+          inserted.username = username || '';
+          inserted.avatar   = avatar   || '';
+          inserted.avatar_type = avatarType || 'emoji';
+          return _msgIn(inserted);
+        } catch (e2) {
+          throw e2;
+        }
+      }
     },
 
     // ===== 私聊 private_chat_msg（无 pair_key，用 from/to 双向查询） =====

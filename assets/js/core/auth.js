@@ -13,24 +13,38 @@
   const REMEMBER_KEY = 'xiao.remember';
 
   /**
-   * 【Fix: invalid email format】
-   * Supabase Auth 严格要求 RFC 5322 邮箱格式，用户名含中文/空格/特殊字符时
-   * `${username}@xiao.local` 会被直接 400。
-   * 这里对用户名做稳定转义：ASCII 字母数字保留，其余字符 -> `__u{codepoint}` 或 %xx 形式。
-   * 关键：同一个用户名必须稳定生成同一个邮箱 local-part（保证注册/登录对得上）。
+   * 【Fix: invalid email format】v2
+   * Supabase Auth 严格要求 RFC 5322 邮箱格式。之前用 encodeURIComponent + 下划线
+   * 替换的方案仍被 Supabase 拒绝（连续下划线或大写字母触发某些校验）。
+   *
+   * 新方案：用户名 → UTF-8 bytes → 纯 hex 字符串（只含 0-9a-f），加 `u_` 前缀
+   * 保证以字母开头。这样 local-part 绝对只含 a-f0-9_，符合 RFC 5322 dot-atom。
+   *
+   * 例：`企海狐` → UTF-8 9 字节 → hex `e4bc81e6b5b7e78b90`
+   *     邮箱 = `u_e4bc81e6b5b7e78b90@xiao.local`
+   *
+   * 稳定性：同一用户名恒等映射，注册/登录对得上。
+   * 长度：每中文字符 6 hex 字符，20 字中文 = 120 字符 > RFC 64 限制 → hash 截断。
    */
   function _encodeUsername(u) {
     if (!u) return 'empty';
     const s = String(u).trim();
-    let out = '';
-    // 优先走 encodeURIComponent 但把 % 换成 _，@ 符号必须被转义否则邮箱格式非法
-    const encoded = encodeURIComponent(s).replace(/%/g, '_').replace(/\./g, '_d').replace(/@/g, '_at_');
-    // 再加前缀 u_ 防止以数字/特殊字符开头（. _ 开头也不合规）
-    out = 'u_' + encoded;
-    // RFC 5322 local-part 限制 64 字节，过长就裁掉加 hash 后缀保证不冲突
-    if (out.length > 60) {
-      let h = 0; for (let i = 0; i < out.length; i++) h = ((h << 5) - h + out.charCodeAt(i)) | 0;
-      out = out.slice(0, 50) + '_h' + Math.abs(h).toString(36);
+    // TextEncoder 把字符串转 UTF-8 字节，再转 hex（小写）
+    const bytes = new TextEncoder().encode(s);
+    let hex = '';
+    for (let i = 0; i < bytes.length; i++) {
+      hex += bytes[i].toString(16).padStart(2, '0');
+    }
+    // 加 u_ 前缀保证字母开头（hex 可能以数字开头，虽 RFC 允许但保险起见）
+    let out = 'u_' + hex;
+    // RFC 5322 local-part 上限 64 字节，超长就 djb2 hash 截断
+    if (out.length > 62) {
+      let h = 5381;
+      for (let i = 0; i < out.length; i++) {
+        h = ((h << 5) + h + out.charCodeAt(i)) | 0;
+      }
+      out = 'u_' + Math.abs(h).toString(16) + '_' + hex.slice(0, 50);
+      if (out.length > 62) out = out.slice(0, 62);
     }
     return out;
   }
@@ -74,10 +88,15 @@
     /** 注册：先建 Auth 账号，再写 profile（初始 Ttpx_A=10） */
     async register({ username, password, confirm, phone, avatar, avatarType }) {
       if (!X.supabaseReady) return { ok: false, msg: 'Supabase 未配置' };
-      if (!username || !password || !phone) return { ok: false, msg: X.t('err.required') };
-      if (!X.utils.isPassword(password)) return { ok: false, msg: X.t('err.required') };
+      // 【Fix: 精准字段必填提示】之前统一报"此项必填"，用户不知道漏填哪一项
+      if (!username) return { ok: false, msg: '账号名必填' };
+      if (!confirm)  return { ok: false, msg: '二次密码必填' };
+      if (!phone)    return { ok: false, msg: '手机号必填' };
+      if (!password) return { ok: false, msg: '密码必填' };
+      if (!X.utils.isPassword(password)) return { ok: false, msg: '密码至少 6 位' };
       if (password !== confirm) return { ok: false, msg: X.t('err.passwordMismatch') };
-      if (!X.utils.isPhone(phone)) return { ok: false, msg: X.t('err.phoneFormat') };
+      // 手机号格式不对，直接指出来（isPhone 会先去掉空格/横杠再判）
+      if (!X.utils.isPhone(phone)) return { ok: false, msg: X.t('err.phoneFormat') || '手机号格式不正确（6-15位数字）' };
 
       // [FIX: 消除 401 预检] 用户名唯一性预检直接跳过：
       // 1) 匿名访问 profiles 会 401，查不出来且刷屏

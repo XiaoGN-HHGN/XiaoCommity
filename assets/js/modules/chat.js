@@ -56,13 +56,15 @@
       const emojiBtn = X.utils.$('#ch_emoji');
       if (emojiBtn) emojiBtn.addEventListener('click', () => this.toggleEmoji());
 
-      // Supabase Realtime：订阅大厅新消息
+      // Supabase Realtime：订阅大厅新消息（表名必须对齐真实 T.MESSAGES=public_chat，不能硬编码 'messages'）
       if (X.supabaseReady) {
-        this.sub = X.realtime.onInsert('messages', null, payload => {
+        const realTable = (X.store && X.store.T && X.store.T.MESSAGES) || 'messages';
+        this.sub = X.realtime.onInsert(realTable, null, payload => {
           const m = payload.new;
           if (m && !this.loaded.find(x => x.id === m.id)) {
-            this.loaded.push(m);
-            this.appendMsg(m);
+            const row = this._augment(payload.new);   // Realtime payload 可能缺 sender 快照，补一下
+            this.loaded.push(row);
+            this.appendMsg(row);
           }
         });
       }
@@ -131,6 +133,22 @@
       return s;
     },
 
+    /** 补全行渲染需要的字段（兼容 DB 只存基础列 / Realtime payload 缺快照） */
+    _augment(raw) {
+      if (!raw) return raw;
+      const cur = X.auth.currentUser();
+      const row = Object.assign({}, raw);
+      if (!row.user_id) row.user_id = row.sender_id || raw.user_id;
+      if (!row.text)    row.text    = row.content || raw.text || '';
+      if (!row.username && cur && cur.id === (row.sender_id || row.user_id)) {
+        row.username    = cur.username;
+        row.avatar      = cur.avatar;
+        row.avatar_type = cur.avatar_type;
+      }
+      if (!row.created_at) row.created_at = raw.created_at || new Date().toISOString();
+      return row;
+    },
+
     async send() {
       if (!X.auth.requireLogin()) return;
       const cur = X.auth.currentUser();
@@ -141,12 +159,22 @@
       const btn = X.utils.$('#ch_send');
       if (btn) { btn.disabled = true; }
       try {
-        await X.store.addMessage({
+        // 【Fix: 消息被"虚空吞噬"】之前只 await 结果但不手动 append，
+        // 依赖 Realtime 推送，但 Realtime 经常没在 Dashboard 开或表名错订阅不上。
+        // 现在拿到 insert 返回的行立刻 append 到列表，100% 显示不依赖推送。
+        const inserted = await X.store.addMessage({
           userId: cur.id, username: cur.username, avatar: cur.avatar, avatarType: cur.avatar_type, text
         });
-        // Realtime 会推送，无需手动 append；但为兼容未启用 Realtime 的情况兜底
-        if (!this.sub) { await this.renderMessages(); }
+        if (inserted) {
+          const row = this._augment(inserted);
+          // 去重：Realtime 如果同时推送，防止重复渲染
+          if (!this.loaded.find(x => x.id === row.id)) {
+            this.loaded.push(row);
+            this.appendMsg(row);
+          }
+        }
       } catch (e) {
+        console.debug('[Xiao] chat send fail →', e && e.message);
         X.ui.toast('发送失败', 'err');
       } finally {
         input.value = ''; input.style.height = 'auto';
