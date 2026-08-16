@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b1220" />
+  <meta name="description" content="Xiao - 企海狐协会 · 理科专业爱好者在线虚拟社区" />
+  <title>Xiao · 企海狐协会</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ctext y='52' font-size='52'%3E%F0%9F%A6%8A%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="assets/css/base.css" />
+  <link rel="stylesheet" href="assets/css/components.css" />
+  <link rel="stylesheet" href="assets/css/pages.css" />
+</head>
+<body>
+  <!-- 顶部导航 -->
+  <header class="topbar" id="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#/home" data-route="home">
+        <span class="brand-mark">狐</span>
+        <span class="brand-text">Xiao<small>企海狐协会</small></span>
+      </a>
+      <nav class="nav" id="mainNav"></nav>
+      <div class="topbar-right">
+        <div class="lang-switch" id="langSwitch">
+          <button data-lang="zh-CN" class="active">中</button>
+          <button data-lang="en">EN</button>
+          <button data-lang="ru">RU</button>
+        </div>
+        <button class="icon-btn" id="redeemBtn" title="兑换码" aria-label="兑换码">✦</button>
+        <div class="user-chip" id="userChip"></div>
+      </div>
+    </div>
+  </header>
+
+  <!-- 主内容区 -->
+  <main class="app-main" id="appView">
+    <div class="loader-line"></div>
+  </main>
+
+  <!-- 通用弹窗容器 -->
+  <div class="modal-root" id="modalRoot" aria-hidden="true"></div>
+
+  <!-- 顶部消息提示 -->
+  <div class="toast-root" id="toastRoot" aria-live="polite"></div>
+
+  <!-- 页脚 -->
+  <footer class="app-footer">
+    <div class="footer-inner">
+      <span>© 2026 Xiao · 企海狐协会</span>
+      <span class="footer-sub" data-i18n="footer.brand">企鹅 + 海豚 + 雪狐融合</span>
+    </div>
+  </footer>
+
+  <!-- 全局命名空间：window.Xiao，顺序敏感（i18n消息 → 核心 → 模块 → 入口） -->
+  <script src="assets/js/i18n/zh-CN.js"></script>
+  <script src="assets/js/i18n/en.js"></script>
+  <script src="assets/js/i18n/ru.js"></script>
+  <script src="assets/js/core/i18n.js"></script>
+  <script src="assets/js/core/utils.js"></script>
+  <script src="assets/js/core/store.js"></script>
+  <script src="assets/js/core/auth.js"></script>
+  <script src="assets/js/core/router.js"></script>
+  <script src="assets/js/core/ui.js"></script>
+  <script src="assets/js/modules/home.js"></script>
+  <script src="assets/js/modules/auth.js"></script>
+  <script src="assets/js/modules/chat.js"></script>
+  <script src="assets/js/modules/works.js"></script>
+  <script src="assets/js/modules/editor.js"></script>
+  <script src="assets/js/modules/profile.js"></script>
+  <script src="assets/js/modules/admin.js"></script>
+  <script src="assets/js/modules/social.js"></script>
+  <script src="assets/js/modules/misc.js"></script>
+  <script src="assets/js/app.js"></script>
+</body>
+</html>
