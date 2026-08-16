@@ -50,26 +50,54 @@
       if (!X.utils.isPassword(password)) return { ok: false, msg: X.t('err.required') };
       if (password !== confirm) return { ok: false, msg: X.t('err.passwordMismatch') };
       if (!X.utils.isPhone(phone)) return { ok: false, msg: X.t('err.phoneFormat') };
-      // 用户名唯一性预检
-      const exist = await X.store.getUserByName(username);
-      if (exist) return { ok: false, msg: X.t('err.userExists') };
+
+      // [FIX: 消除 401 预检] 用户名唯一性预检直接跳过：
+      // 1) 匿名访问 profiles 会 401，查不出来且刷屏
+      // 2) Supabase Auth 的 email 唯一性本身就能兜底（重复用户名=重复 email → signUp 直接报错 "already registered"）
+      //    等用户登录后再预检也不迟。
 
       const email = `${username}@${X.SUPABASE_CONFIG.EMAIL_DOMAIN}`;
-      const { data, error } = await X.db.auth.signUp({ email, password });
+      // 带 rawUserMeta，保证 trigger handle_new_user 就算列名对不上，前端也能拿到 username/phone 兜底写
+      const { data, error } = await X.db.auth.signUp({
+        email,
+        password,
+        options: {
+          data: {
+            username, phone, avatar,
+            avatar_type: avatarType || 'emoji'
+          }
+        }
+      });
       if (error) {
-        // 用户名已占用（合成邮箱重复）等
-        return { ok: false, msg: X.t('err.userExists') };
+        // [FIX] 把 Supabase 完整错误对象打到控制台，包含 msg/code/hint，便于定位 500
+        console.warn('[Xiao] signUp error →', error);
+        const m = error.message || String(error);
+        // 常见错误类型归一化提示，其余原样回传，让用户能贴给我
+        if (m && (m.indexOf('already') >= 0 || m.indexOf('exist') >= 0)) {
+          return { ok: false, msg: X.t('err.userExists') };
+        }
+        return { ok: false, msg: m };
       }
       const uid = data.user && data.user.id;
       if (!uid) return { ok: false, msg: X.t('err.loginFail') };
-      // 写 profile
+      // 写 profile：trigger 可能已经写了，前端用 upsert 避免键冲突
       try {
         await X.store.createProfile({ id: uid, username, phone, avatar, avatarType });
       } catch (e) {
-        // profile 写入失败（极少见，RLS），回退提示
-        console.warn('createProfile fail', e);
+        // profile 写入失败：如果是 23505（唯一键冲突）= trigger 已写过，正常；否则打日志
+        const msg = (e && e.message) || '';
+        if (msg.indexOf('23505') < 0 && msg.indexOf('duplicate') < 0) {
+          console.warn('createProfile fail →', e);
+        }
       }
-      this._profile = await X.store.getUser(uid);
+      // 拉 profile 失败不阻止注册成功（至少 _profile 有基本字段，页面不会崩）
+      let profile = null;
+      try { profile = await X.store.getUser(uid); } catch (_) {}
+      this._profile = profile || {
+        id: uid, username, phone, avatar, avatar_type: avatarType || 'emoji',
+        ttpx_a: 10, role: 'user', realname: false, banned: null, muted: null,
+        bio: '', created_at: new Date().toISOString()
+      };
       return { ok: true, user: this._profile };
     },
 
@@ -78,7 +106,13 @@
       if (!X.supabaseReady) return { ok: false, msg: 'Supabase 未配置' };
       const email = `${username}@${X.SUPABASE_CONFIG.EMAIL_DOMAIN}`;
       const { data, error } = await X.db.auth.signInWithPassword({ email, password });
-      if (error || !data.user) return { ok: false, msg: X.t('err.loginFail') };
+      if (error || !data.user) {
+        // [FIX] 暴露 Supabase 真实错误信息，便于定位 400 根因（如 Email not confirmed）
+        console.warn('[Xiao] signIn error:', error && error.status, error && error.message);
+        const m = (error && error.message) || X.t('err.loginFail');
+        // "Email not confirmed" 这类直接回传给用户，提示去关 Confirm email
+        return { ok: false, msg: m };
+      }
       const uid = data.user.id;
       this._profile = await X.store.getUser(uid);
       if (!this._profile) return { ok: false, msg: X.t('err.loginFail') };
