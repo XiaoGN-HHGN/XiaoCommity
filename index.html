@@ -10,6 +10,8 @@
   <link rel="stylesheet" href="assets/css/base.css" />
   <link rel="stylesheet" href="assets/css/components.css" />
   <link rel="stylesheet" href="assets/css/pages.css" />
+  <!-- Supabase 官方 JS SDK（头部引入，window.supabase.createClient 可用） -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.0/dist/umd/supabase.min.js"></script>
 </head>
 <body>
   <!-- 顶部导航 -->
@@ -51,10 +53,12 @@
     </div>
   </footer>
 
-  <!-- 全局命名空间：window.Xiao，顺序敏感（i18n消息 → 核心 → 模块 → 入口） -->
+  <!-- 全局命名空间：window.Xiao，顺序敏感（i18n消息 → supabase → 核心 → 模块 → 入口） -->
   <script src="assets/js/i18n/zh-CN.js"></script>
   <script src="assets/js/i18n/en.js"></script>
   <script src="assets/js/i18n/ru.js"></script>
+  <script src="assets/js/core/config.js"></script>
+  <script src="assets/js/core/supabase.js"></script>
   <script src="assets/js/core/i18n.js"></script>
   <script src="assets/js/core/utils.js"></script>
   <script src="assets/js/core/store.js"></script>

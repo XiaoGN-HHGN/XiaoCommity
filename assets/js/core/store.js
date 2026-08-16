@@ -1,309 +1,241 @@
 // ============================================================
-// Xiao · 核心层 · 数据存储
-// 基于 localStorage 的轻量数据层（静态站无后端，本地持久化）
-// 模块化集合：users / works / messages / social / reports / logs
+// Xiao · 数据访问层（Supabase）
+// 全部方法为异步 Promise；通过 X.dbq 统一封装访问 Postgres。
+// 表结构见 SETUP.md。所有业务规则不变（代币/封禁/实名/定价/点赞等）。
+// 模块按需调用，禁止全量预加载，避免卡顿。
 // ============================================================
 (function (X) {
-  const PREFIX = 'xiao.';
-  const K = {
-    USERS: PREFIX + 'users',
-    WORKS: PREFIX + 'works',
-    CHAT: PREFIX + 'chat.public',
-    DM: PREFIX + 'chat.dm',
-    FRIENDS: PREFIX + 'social.friends',
-    BLOCKED: PREFIX + 'social.blocked',
-    GROUPS: PREFIX + 'social.groups',
-    REPORTS: PREFIX + 'reports',
-    LOGS: PREFIX + 'admin.logs',
-    SESSION: PREFIX + 'session',
-    COUNTER: PREFIX + 'counter'
+  const T = {
+    PROFILES: 'profiles',
+    MESSAGES: 'messages',         // 公共大厅
+    DM: 'dm_messages',            // 私聊
+    WORKS: 'works',
+    WORK_LIKES: 'work_likes',
+    DL_REQS: 'download_requests',
+    FREQ: 'friend_requests',
+    FRIENDS: 'friendships',
+    BLOCKS: 'blocks',
+    GROUPS: 'groups',
+    GMEMBERS: 'group_members',
+    GMSGS: 'group_messages',
+    REPORTS: 'reports',
+    LOGS: 'admin_logs'
   };
 
-  function read(key, def) {
-    try {
-      const raw = localStorage.getItem(key);
-      return raw == null ? def : JSON.parse(raw);
-    } catch { return def; }
-  }
-  function write(key, val) {
-    try { localStorage.setItem(key, JSON.stringify(val)); return true; }
-    catch (e) { console.warn('storage write fail', e); return false; }
-  }
-
-  /** 自增 ID 生成器 */
-  function nextId(seq) {
-    const c = read(K.COUNTER, {});
-    c[seq] = (c[seq] || 0) + 1;
-    write(K.COUNTER, c);
-    return Date.now().toString(36) + c[seq].toString(36);
-  }
-
   const store = {
-    K,
-    read, write, nextId,
+    T,
 
-    // ===== 用户 =====
-    getUsers() { return read(K.USERS, []); },
-    getUser(id) { return this.getUsers().find(u => u.id === id); },
-    getUserByName(name) { return this.getUsers().find(u => u.username === name); },
-    saveUser(user) {
-      const users = this.getUsers();
-      const i = users.findIndex(u => u.id === user.id);
-      if (i >= 0) users[i] = user; else users.push(user);
-      write(K.USERS, users);
-      return user;
+    // ===== 用户 profiles =====
+    async getUsers() { return X.dbq.select(T.PROFILES, { order: ['created_at', { ascending: true }] }); },
+    async getUser(id) { return X.dbq.select(T.PROFILES, { eq: ['id', id], single: true }); },
+    async getUserByName(name) { return X.dbq.select(T.PROFILES, { eq: ['username', name], single: true }); },
+    async saveUser(user) {
+      // 仅更新可写字段（id 由 auth 决定）
+      return X.dbq.upsert(T.PROFILES, user, { conflict: 'id' });
     },
-    /** 创建用户（注册） */
-    createUser({ username, password, phone, avatar, avatarType }) {
-      const user = {
-        id: nextId('user'),
-        username, password, phone,
+    async updateProfile(id, patch) { return X.dbq.update(T.PROFILES, patch, { eq: ['id', id] }); },
+
+    /**
+     * 创建用户 profile（注册流程：先由 auth.js 创建 Supabase Auth 账号，再写 profile）
+     * 新用户初始 ttpx_a = 10
+     */
+    async createProfile({ id, username, phone, avatar, avatarType }) {
+      const row = {
+        id, username, phone,
         avatar: avatar || X.utils.randAvatar(),
-        avatarType: avatarType || 'emoji', // emoji | dataurl
-        ttpxA: 10,            // 初始 10 枚
-        role: 'user',         // user | admin | super
-        realname: false,      // 实名认证
-        banned: null,         // { until: ts } 或 { perm: true }
-        muted: null,          // { until: ts } 或 { perm: true }
+        avatar_type: avatarType || 'emoji',
+        ttpx_a: 10,
+        role: 'user',
+        realname: false,
+        realname_info: null,
         bio: '',
-        createdAt: Date.now()
+        banned: null,
+        muted: null,
+        created_at: new Date().toISOString()
       };
-      return this.saveUser(user);
+      return X.dbq.insert(T.PROFILES, row);
     },
 
-    /** 调整代币（正增负减） */
-    adjustCoin(userId, delta) {
-      const u = this.getUser(userId);
-      if (!u) return null;
-      u.ttpxA = Math.max(0, (u.ttpxA || 0) + delta);
-      this.saveUser(u);
-      return u.ttpxA;
+    /** 调整代币：正增负减；通过 RPC adjust_coin（负值仅管理员可调） */
+    async adjustCoin(userId, delta) {
+      try { return await X.dbq.rpc('adjust_coin', { target: userId, delta: Number(delta) }); }
+      catch (e) { console.warn('adjust_coin rpc fail', e); return null; }
     },
 
-    // ===== 会话（登录态 + 记住密码） =====
-    getSession() { return read(K.SESSION, null); },
-    setSession(userId, remember) {
-      const s = { userId, remember, ts: Date.now() };
-      write(K.SESSION, s);
-      return s;
+    // ===== 公共大厅消息 =====
+    async getChat(limit = 100) {
+      return X.dbq.select(T.MESSAGES, { order: ['created_at', { ascending: true }], limit });
     },
-    clearSession() { localStorage.removeItem(K.SESSION); },
-
-    // ===== 公共聊天 =====
-    getChat() { return read(K.CHAT, []); },
-    addMessage(msg) {
-      const list = this.getChat();
-      list.push({ id: nextId('msg'), ts: Date.now(), ...msg });
-      // 仅保留最近 300 条
-      if (list.length > 300) list.splice(0, list.length - 300);
-      write(K.CHAT, list);
-      return list[list.length - 1];
+    async addMessage({ userId, username, avatar, avatarType, text }) {
+      return X.dbq.insert(T.MESSAGES, {
+        user_id: userId, username, avatar, avatar_type: avatarType,
+        text, created_at: new Date().toISOString()
+      });
     },
 
     // ===== 私聊 =====
     dmKey(a, b) { return [a, b].sort().join('__'); },
-    getDM(userA, userB) {
-      const all = read(K.DM, {});
-      return all[this.dmKey(userA, userB)] || [];
+    async getDM(userA, userB) {
+      const key = this.dmKey(userA, userB);
+      return X.dbq.select(T.DM, { eq: ['pair_key', key], order: ['created_at', { ascending: true }], limit: 200 });
     },
-    addDM(from, to, text) {
-      const all = read(K.DM, {});
-      const key = this.dmKey(from, to);
-      const arr = all[key] || [];
-      arr.push({ id: nextId('dm'), from, to, text, ts: Date.now() });
-      if (arr.length > 200) arr.splice(0, arr.length - 200);
-      all[key] = arr;
-      write(K.DM, all);
-      return arr[arr.length - 1];
+    async addDM(from, fromName, to, text) {
+      return X.dbq.insert(T.DM, {
+        pair_key: this.dmKey(from, to), from_id: from, to_id: to,
+        from_name: fromName, text, created_at: new Date().toISOString()
+      });
     },
 
     // ===== 作品 =====
-    getWorks() { return read(K.WORKS, []); },
-    getWork(id) { return this.getWorks().find(w => w.id === id); },
-    getWorksByUser(userId) { return this.getWorks().filter(w => w.authorId === userId); },
-    saveWork(work) {
-      const list = this.getWorks();
-      const i = list.findIndex(w => w.id === work.id);
-      if (i >= 0) list[i] = work; else list.push(work);
-      write(K.WORKS, list);
-      return work;
-    },
-    createWork({ authorId, name, desc, category, price, fileName, fileContent, fileType }) {
-      const work = {
-        id: nextId('work'),
-        authorId, name, desc,
-        category,             // sci | paper | code | game
+    async getWorks() { return X.dbq.select(T.WORKS, { order: ['created_at', { ascending: false }] }); },
+    async getWork(id) { return X.dbq.select(T.WORKS, { eq: ['id', id], single: true }); },
+    async getWorksByUser(userId) { return X.dbq.select(T.WORKS, { eq: ['author_id', userId], order: ['created_at', { ascending: false }] }); },
+    async saveWork(work) { return X.dbq.update(T.WORKS, work, { eq: ['id', work.id] }); },
+    async createWork({ authorId, name, desc, category, price, fileName, filePath, fileType }) {
+      return X.dbq.insert(T.WORKS, {
+        author_id: authorId, name, desc, category,
         price: Number(price) || 0,
-        fileName, fileContent, fileType,
-        status: 'pending',     // pending(待审核) | approved | rejected
-        likes: 0, likedBy: [],
-        downloadReqs: [],      // [{ userId, status: pending|approved|rejected }]
-        createdAt: Date.now()
-      };
-      return this.saveWork(work);
+        file_name: fileName, file_path: filePath, file_type: fileType,
+        status: 'pending', likes: 0, created_at: new Date().toISOString()
+      });
     },
-    /** 点赞：免费；作者 +0.01 */
-    toggleLike(workId, userId) {
-      const w = this.getWork(workId);
-      if (!w) return null;
-      const i = w.likedBy.indexOf(userId);
-      let liked;
-      if (i >= 0) { w.likedBy.splice(i, 1); w.likes = Math.max(0, w.likes - 1); liked = false; }
-      else { w.likedBy.push(userId); w.likes++; liked = true; this.adjustCoin(w.authorId, 0.01); }
-      this.saveWork(w);
-      return { liked, likes: w.likes };
+    /** 点赞：免费；新增点赞作者 +0.01 Ttpx_A（通过 RPC adjust_coin） */
+    async toggleLike(workId, userId) {
+      const existing = await X.dbq.select(T.WORK_LIKES, { filter: { work_id: workId, user_id: userId } });
+      const work = await this.getWork(workId);
+      if (!work) return null;
+      if (existing.length) {
+        await X.dbq.remove(T.WORK_LIKES, { filter: { work_id: workId, user_id: userId } });
+        await X.dbq.update(T.WORKS, { likes: Math.max(0, (work.likes || 0) - 1) }, { eq: ['id', workId] });
+        return { liked: false, likes: Math.max(0, (work.likes || 0) - 1) };
+      }
+      await X.dbq.insert(T.WORK_LIKES, { work_id: workId, user_id: userId, created_at: new Date().toISOString() });
+      await X.dbq.update(T.WORKS, { likes: (work.likes || 0) + 1 }, { eq: ['id', workId] });
+      await this.adjustCoin(work.author_id, 0.01);
+      return { liked: true, likes: (work.likes || 0) + 1 };
+    },
+    /** 是否已点赞（批量加载作品时用） */
+    async getMyLike(workId, userId) {
+      const r = await X.dbq.select(T.WORK_LIKES, { filter: { work_id: workId, user_id: userId } });
+      return r.length > 0;
+    },
+
+    // ===== 下载申请 =====
+    async getDownloadReq(workId, userId) {
+      const r = await X.dbq.select(T.DL_REQS, { filter: { work_id: workId, user_id: userId } });
+      return r[0] || null;
+    },
+    async addDownloadReq(workId, userId) {
+      return X.dbq.insert(T.DL_REQS, { work_id: workId, user_id: userId, status: 'pending', created_at: new Date().toISOString() });
+    },
+    async setDownloadReq(workId, userId, status) {
+      await X.dbq.update(T.DL_REQS, { status }, { filter: { work_id: workId, user_id: userId } });
+    },
+    async getDownloadReqsForAuthor(authorId) {
+      // 作者视角：拿到自己作品的下载申请（需联表，这里先用两步）
+      const works = await this.getWorksByUser(authorId);
+      const ids = works.map(w => w.id);
+      if (!ids.length) return [];
+      // 一次取全部申请，再在客户端过滤
+      const all = await X.dbq.select(T.DL_REQS, { filter: {} });
+      return all.filter(r => ids.includes(r.work_id));
     },
 
     // ===== 好友 =====
-    getFriends(userId) {
-      const all = read(K.FRIENDS, {});
-      return all[userId] || [];
+    async getFriends(userId) {
+      const rows = await X.dbq.select(T.FRIENDS, { eq: ['user_id', userId] });
+      return rows.map(r => r.friend_id);
     },
-    getFriendReqs(userId) {
-      const all = read(K.FRIENDS + '.req', {});
-      return (all[userId] || []).filter(r => r.status === 'pending');
+    async getFriendReqs(userId) {
+      return X.dbq.select(T.FREQ, { eq: ['to_id', userId], order: ['created_at', { ascending: false }] });
     },
-    sendFriendReq(fromId, toId) {
-      const all = read(K.FRIENDS + '.req', {});
-      const arr = all[toId] || [];
-      if (arr.find(r => r.from === fromId && r.status === 'pending')) return false;
-      arr.push({ id: nextId('freq'), from: fromId, to: toId, status: 'pending', ts: Date.now() });
-      all[toId] = arr;
-      write(K.FRIENDS + '.req', all);
+    async sendFriendReq(fromId, fromName, toId) {
+      const exist = await X.dbq.select(T.FREQ, { filter: { from_id: fromId, to_id: toId, status: 'pending' } });
+      if (exist.length) return false;
+      await X.dbq.insert(T.FREQ, { from_id: fromId, from_name: fromName, to_id: toId, status: 'pending', created_at: new Date().toISOString() });
       return true;
     },
-    resolveFriendReq(reqId, toId, accept) {
-      const all = read(K.FRIENDS + '.req', {});
-      const arr = all[toId] || [];
-      const r = arr.find(x => x.id === reqId);
-      if (!r) return false;
-      r.status = accept ? 'accepted' : 'rejected';
-      all[toId] = arr;
-      write(K.FRIENDS + '.req', all);
+    async resolveFriendReq(reqId, toId, accept) {
+      const reqs = await X.dbq.select(T.FREQ, { eq: ['id', reqId] });
+      const r = reqs[0]; if (!r) return false;
+      await X.dbq.update(T.FREQ, { status: accept ? 'accepted' : 'rejected' }, { eq: ['id', reqId] });
       if (accept) {
-        const fa = this.getFriends(r.from); if (!fa.includes(toId)) fa.push(toId); write(K.FRIENDS, { ...read(K.FRIENDS, {}), [r.from]: fa });
-        const fb = this.getFriends(toId); if (!fb.includes(r.from)) fb.push(r.from); write(K.FRIENDS, { ...read(K.FRIENDS, {}), [toId]: fb });
+        await X.dbq.upsert(T.FRIENDS, { user_id: r.from_id, friend_id: r.to_id, created_at: new Date().toISOString() }, { conflict: 'user_id,friend_id' });
+        await X.dbq.upsert(T.FRIENDS, { user_id: r.to_id, friend_id: r.from_id, created_at: new Date().toISOString() }, { conflict: 'user_id,friend_id' });
       }
       return true;
     },
-    removeFriend(userId, otherId) {
-      const all = read(K.FRIENDS, {});
-      [userId, otherId].forEach(uid => {
-        const arr = all[uid] || [];
-        const i = arr.indexOf(uid === userId ? otherId : userId);
-        if (i >= 0) arr.splice(i, 1);
-        all[uid] = arr;
-      });
-      write(K.FRIENDS, all);
+    async removeFriend(userId, otherId) {
+      await X.dbq.remove(T.FRIENDS, { filter: { user_id: userId, friend_id: otherId } });
+      await X.dbq.remove(T.FRIENDS, { filter: { user_id: otherId, friend_id: userId } });
     },
 
     // ===== 拉黑 =====
-    getBlocked(userId) {
-      const all = read(K.BLOCKED, {});
-      return all[userId] || [];
+    async getBlocked(userId) {
+      const rows = await X.dbq.select(T.BLOCKS, { eq: ['user_id', userId] });
+      return rows.map(r => r.blocked_id);
     },
-    block(userId, otherId) {
-      const all = read(K.BLOCKED, {});
-      const arr = all[userId] || [];
-      if (!arr.includes(otherId)) arr.push(otherId);
-      all[userId] = arr; write(K.BLOCKED, all);
+    async block(userId, otherId) {
+      await X.dbq.upsert(T.BLOCKS, { user_id: userId, blocked_id: otherId, created_at: new Date().toISOString() }, { conflict: 'user_id,blocked_id' });
     },
-    unblock(userId, otherId) {
-      const all = read(K.BLOCKED, {});
-      const arr = (all[userId] || []).filter(x => x !== otherId);
-      all[userId] = arr; write(K.BLOCKED, all);
+    async unblock(userId, otherId) {
+      await X.dbq.remove(T.BLOCKS, { filter: { user_id: userId, blocked_id: otherId } });
     },
 
-    // ===== 群组（创建消耗 20 Ttpx_A） =====
-    getGroups() { return read(K.GROUPS, []); },
-    getGroupsByUser(userId) { return this.getGroups().filter(g => g.ownerId === userId || g.members.includes(userId)); },
-    createGroup(ownerId, name) {
-      const g = { id: nextId('grp'), ownerId, name, members: [ownerId], admins: [], createdAt: Date.now() };
-      const list = this.getGroups(); list.push(g); write(K.GROUPS, list);
+    // ===== 群组（创建消耗 20 Ttpx_A，上限 20 人） =====
+    async getGroups() { return X.dbq.select(T.GROUPS, { order: ['created_at', { ascending: false }] }); },
+    async getGroup(id) { return X.dbq.select(T.GROUPS, { eq: ['id', id], single: true }); },
+    async getGroupsByUser(userId) {
+      const members = await X.dbq.select(T.GMEMBERS, { eq: ['user_id', userId] });
+      const ids = members.map(m => m.group_id);
+      if (!ids.length) return [];
+      const all = await this.getGroups();
+      return all.filter(g => ids.includes(g.id));
+    },
+    async createGroup(ownerId, ownerName, name) {
+      const g = await X.dbq.insert(T.GROUPS, { owner_id: ownerId, name, created_at: new Date().toISOString() });
+      await X.dbq.insert(T.GMEMBERS, { group_id: g.id, user_id: ownerId, member_name: ownerName, role: 'admin', created_at: new Date().toISOString() });
       return g;
     },
-    addGroupMember(groupId, userId) {
-      const list = this.getGroups();
-      const g = list.find(x => x.id === groupId);
-      if (g && g.members.length < 20 && !g.members.includes(userId)) { g.members.push(userId); write(K.GROUPS, list); }
-      return g;
+    async getGroupMembers(groupId) { return X.dbq.select(T.GMEMBERS, { eq: ['group_id', groupId] }); },
+    async addGroupMember(groupId, userId, name) {
+      const members = await this.getGroupMembers(groupId);
+      if (members.length >= 20 || members.find(m => m.user_id === userId)) return false;
+      await X.dbq.insert(T.GMEMBERS, { group_id: groupId, user_id: userId, member_name: name, role: 'member', created_at: new Date().toISOString() });
+      return true;
     },
-    removeGroupMember(groupId, userId) {
-      const list = this.getGroups();
-      const g = list.find(x => x.id === groupId);
-      if (g) { g.members = g.members.filter(m => m !== userId); g.admins = g.admins.filter(a => a !== userId); write(K.GROUPS, list); }
-      return g;
+    async removeGroupMember(groupId, userId) {
+      await X.dbq.remove(T.GMEMBERS, { filter: { group_id: groupId, user_id: userId } });
     },
-    /** 群聊消息（独立存储） */
-    getGroupMessages(groupId) {
-      const all = read(K.GROUPS + '.msg', {});
-      return all[groupId] || [];
+    async getGroupMessages(groupId) {
+      return X.dbq.select(T.GMSGS, { eq: ['group_id', groupId], order: ['created_at', { ascending: true }], limit: 200 });
     },
-    addGroupMessage(groupId, userId, text) {
-      const all = read(K.GROUPS + '.msg', {});
-      const arr = all[groupId] || [];
-      arr.push({ id: nextId('gmsg'), userId, text, ts: Date.now() });
-      if (arr.length > 300) arr.splice(0, arr.length - 300);
-      all[groupId] = arr;
-      write(K.GROUPS + '.msg', all);
-      return arr[arr.length - 1];
+    async addGroupMessage(groupId, userId, username, avatar, avatarType, text) {
+      return X.dbq.insert(T.GMSGS, {
+        group_id: groupId, user_id: userId, username, avatar, avatar_type: avatarType,
+        text, created_at: new Date().toISOString()
+      });
     },
 
     // ===== 举报 =====
-    getReports() { return read(K.REPORTS, []); },
-    addReport({ reporterId, targetType, targetId, reason }) {
-      const list = this.getReports();
-      const r = { id: nextId('rpt'), reporterId, targetType, targetId, reason, status: 'pending', ts: Date.now() };
-      list.push(r); write(K.REPORTS, list);
-      return r;
+    async getReports() { return X.dbq.select(T.REPORTS, { order: ['created_at', { ascending: false }] }); },
+    async addReport({ reporterId, targetType, targetId, reason }) {
+      return X.dbq.insert(T.REPORTS, {
+        reporter_id: reporterId, target_type: targetType, target_id: targetId, reason,
+        status: 'pending', created_at: new Date().toISOString()
+      });
     },
-    resolveReport(id, action, note) {
-      const list = this.getReports();
-      const r = list.find(x => x.id === id);
-      if (r) { r.status = 'resolved'; r.action = action; r.note = note; r.resolvedAt = Date.now(); write(K.REPORTS, list); }
-      return r;
+    async resolveReport(id, action, note) {
+      await X.dbq.update(T.REPORTS, { status: 'resolved', action, note, resolved_at: new Date().toISOString() }, { eq: ['id', id] });
     },
 
     // ===== 管理员操作记录 =====
-    getLogs() { return read(K.LOGS, []); },
-    addLog({ operatorId, action, targetUserId, reason, meta }) {
-      const list = this.getLogs();
-      list.unshift({ id: nextId('log'), operatorId, action, targetUserId, reason, meta, ts: Date.now() });
-      if (list.length > 500) list.length = 500;
-      write(K.LOGS, list);
-      return list[0];
-    },
-
-    // ===== 种子数据（首次访问） =====
-    seedIfEmpty() {
-      if (this.getUsers().length > 0) return;
-      // 内置超级管理员
-      const superAdmin = {
-        id: nextId('user'), username: 'admin', password: 'admin888',
-        phone: '13800000000', avatar: '🛡️', avatarType: 'emoji',
-        ttpxA: 9999, role: 'super', realname: true,
-        banned: null, muted: null, bio: 'Xiao 超级管理员', createdAt: Date.now()
-      };
-      this.saveUser(superAdmin);
-      // 示例用户 + 示例作品，便于体验
-      const demo = this.createUser({ username: 'demo', password: 'demo123', phone: '13900000000', avatar: '🐬', avatarType: 'emoji' });
-      this.createWork({
-        authorId: demo.id, name: 'FFT 快速傅里叶变换可视化', desc: '基于 Canvas 的实时频谱演示', category: 'code', price: 0,
-        fileName: 'fft.html', fileContent: '<h1>FFT Demo</h1><canvas id=c></canvas><script>const c=document.getElementById("c");const x=c.getContext("2d");c.width=400;c.height=200;let t=0;(function f(){x.clearRect(0,0,400,200);x.strokeStyle="#2fe3c4";x.beginPath();for(let i=0;i<400;i++){x.lineTo(i,100+Math.sin(i/20+t)*40);}x.stroke();t+=.05;requestAnimationFrame(f)})()</script>', fileType: 'html'
+    async getLogs(limit = 200) { return X.dbq.select(T.LOGS, { order: ['created_at', { ascending: false }], limit }); },
+    async addLog({ operatorId, action, targetUserId, reason, meta }) {
+      return X.dbq.insert(T.LOGS, {
+        operator_id: operatorId, action, target_user_id: targetUserId, reason,
+        meta: meta || null, created_at: new Date().toISOString()
       });
-      this.createWork({
-        authorId: demo.id, name: '量子隧穿效应模拟论文', desc: '一维势垒穿透概率推导', category: 'paper', price: 2,
-        fileName: 'quantum.txt', fileContent: '量子隧穿：当粒子能量小于势垒高度时，波函数仍以指数衰减形式穿透势垒，透射系数 T ≈ exp(-2κa)。',
-        fileType: 'txt'
-      });
-      this.createWork({
-        authorId: demo.id, name: '贪吃蛇（学术减压）', desc: 'Canvas 贪吃蛇，课间放松', category: 'game', price: 0,
-        fileName: 'snake.html', fileContent: '<h3>Snake</h3><canvas id=g width=300 height=300 style="border:1px solid #ccc"></canvas><script>const g=document.getElementById("g");const x=g.getContext("2d");let s=[{x:10,y:10}],d={x:1,y:0},f={x:5,y:5};onkeydown=e=>{if(e.key=="ArrowUp")d={x:0,y:-1};if(e.key=="ArrowDown")d={x:0,y:1};if(e.key=="ArrowLeft")d={x:-1,y:0};if(e.key=="ArrowRight")d={x:1,y:0}};setInterval(()=>{let n={x:(s[0].x+d.x+15)%15,y:(s[0].y+d.y+15)%15};s.unshift(n);if(n.x==f.x&&n.y==f.y)f={x:Math.floor(Math.random()*15),y:Math.floor(Math.random()*15)};else s.pop();x.fillStyle="#0b1220";x.fillRect(0,0,300,300);x.fillStyle="#2fe3c4";s.forEach(p=>x.fillRect(p.x*20,p.y*20,18,18));x.fillStyle="#ffd76a";x.fillRect(f.x*20,f.y*20,18,18)},100)</script>', fileType: 'html'
-      });
-      // 把示例作品直接审核通过
-      this.getWorks().forEach(w => { w.status = 'approved'; this.saveWork(w); });
-      // 示例公共消息
-      this.addMessage({ userId: demo.id, text: '欢迎来到 Xiao 企海狐协会 🐬理科社区，畅聊学术与科创！' });
     }
   };
 

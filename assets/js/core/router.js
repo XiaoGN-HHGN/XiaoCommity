@@ -31,11 +31,21 @@
     /** 渲染当前路由 */
     async render() {
       const { name, params } = this.parse();
-      this.current = { name, params };
-      const cfg = this.routes[name];
       const view = X.utils.$('#appView');
       const loader = X.utils.$('.loader-line');
       if (loader) loader.classList.add('active');
+
+      // 路由切换前清理上一页资源（Realtime 订阅 / 定时器等）
+      if (this.current && this.current.name !== name) {
+        const prevCfg = this.routes[this.current.name];
+        if (prevCfg && typeof prevCfg.onLeave === 'function') {
+          try { await prevCfg.onLeave(this.current.params, view); }
+          catch (e) { console.warn('route onLeave error', this.current.name, e); }
+        }
+      }
+
+      this.current = { name, params };
+      const cfg = this.routes[name];
 
       // 未找到路由
       if (!cfg) {
@@ -45,8 +55,9 @@
         return;
       }
 
-      // 权限校验
-      if (cfg.requiresAuth && !X.auth.isLogin()) {
+      // 权限校验（临时管理员兑换码可绕过 requiresAuth 访问 admin）
+      const tempAdmin = localStorage.getItem('xiao.tempAdmin') === '1';
+      if (cfg.requiresAuth && !X.auth.isLogin() && !tempAdmin) {
         X.ui.toast(X.t('err.notLogin'), 'err');
         this.go('login');
         return;
@@ -60,7 +71,10 @@
       try {
         const html = await cfg.render(params, view);
         if (typeof html === 'string') view.innerHTML = html;
-        if (typeof cfg.afterRender === 'function') cfg.afterRender(params, view);
+        // afterRender 支持 await（异步绑定 / Realtime 订阅）
+        if (typeof cfg.afterRender === 'function') {
+          await cfg.afterRender(params, view);
+        }
         X.i18n.engine.applyDOM(view);
       } catch (e) {
         console.error('route render error', name, e);

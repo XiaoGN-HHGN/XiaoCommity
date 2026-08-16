@@ -88,19 +88,26 @@
       iframe.srcdoc = doc;
     },
 
-    renderCollab() {
+    async renderCollab() {
       const box = X.utils.$('#ed_collab');
       if (!box) return;
       const cur = X.auth.currentUser();
-      const friends = cur ? X.store.getFriends(cur.id).slice(0, 4) : [];
       box.innerHTML = '';
+      if (!cur) return;
       // 自己
-      if (cur) box.appendChild(this.collabAvatar(cur));
-      friends.forEach(fid => { const f = X.store.getUser(fid); if (f) box.appendChild(this.collabAvatar(f)); });
+      box.appendChild(this.collabAvatar(cur));
+      if (!X.supabaseReady) return;
+      try {
+        const friends = (await X.store.getFriends(cur.id)).slice(0, 4);
+        for (const fid of friends) {
+          const f = await X.store.getUser(fid);
+          if (f) box.appendChild(this.collabAvatar(f));
+        }
+      } catch (e) { /* ignore */ }
     },
 
     collabAvatar(u) {
-      return u.avatarType === 'dataurl'
+      return u.avatar_type === 'dataurl'
         ? X.utils.h('img', { class: 'collab-av', src: u.avatar, title: u.username })
         : X.utils.h('div', { class: 'collab-av', title: u.username, style: { background: 'var(--bg-3)', display: 'grid', placeItems: 'center', fontSize: '11px' } }, [u.avatar]);
     },

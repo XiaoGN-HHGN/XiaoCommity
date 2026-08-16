@@ -130,12 +130,12 @@
         chip.innerHTML = ''; chip.appendChild(reg); chip.appendChild(login);
         return;
       }
-      const av = u.avatarType === 'dataurl'
+      const av = u.avatar_type === 'dataurl'
         ? X.utils.h('img', { class: 'avatar sm', src: u.avatar, alt: u.username })
         : X.utils.h('span', { class: 'avatar sm', style: { display: 'grid', placeItems: 'center', fontSize: '16px' } }, [u.avatar]);
-      const coin = X.utils.h('span', { class: 'coin', title: 'Ttpx_A' }, ['✦ ' + X.utils.coin(u.ttpxA)]);
+      const coin = X.utils.h('span', { class: 'coin', title: 'Ttpx_A' }, ['✦ ' + X.utils.coin(u.ttpx_a)]);
       const name = X.utils.h('span', { class: 'dim', style: { fontSize: '12px' } }, [u.username + (X.auth.isAdmin() ? ' ✦' : '')]);
-      const logout = X.utils.h('button', { class: 'btn ghost sm', onclick: () => { X.auth.logout(); this.refresh(); X.router.go('home'); X.ui.toast(X.t('ok.loggedOut'), 'ok'); } }, [X.t('nav.logout')]);
+      const logout = X.utils.h('button', { class: 'btn ghost sm', onclick: async () => { await X.auth.logout(); this.refresh(); X.router.go('home'); X.ui.toast(X.t('ok.loggedOut'), 'ok'); } }, [X.t('nav.logout')]);
       const chipBtn = X.utils.h('button', { class: 'btn ghost sm', style: { padding: '4px 6px' }, onclick: () => X.router.go('profile') }, [av, name]);
       chip.innerHTML = ''; chip.appendChild(coin); chip.appendChild(chipBtn); chip.appendChild(logout);
     },

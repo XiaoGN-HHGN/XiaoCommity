@@ -102,28 +102,44 @@
       X.utils.$$('#rg_avopts .opt').forEach(b => b.classList.remove('active'));
     },
 
-    doLogin() {
+    async doLogin() {
       const username = X.utils.$('#lg_un').value.trim();
       const password = X.utils.$('#lg_pw').value;
       const remember = X.utils.$('#lg_remember').checked;
-      const r = X.auth.login(username, password, remember);
-      if (!r.ok) { X.ui.toast(r.msg, 'err'); return; }
-      X.ui.toast(X.t('ok.loggedIn'), 'ok');
-      X.ui.refresh();
-      X.router.go('home');
+      const btn = X.utils.$('#lg_btn');
+      if (btn) { btn.disabled = true; btn.textContent = '...'; }
+      try {
+        const r = await X.auth.login(username, password, remember);
+        if (!r.ok) { X.ui.toast(r.msg, 'err'); return; }
+        X.ui.toast(X.t('ok.loggedIn'), 'ok');
+        X.ui.refresh();
+        X.router.go('home');
+      } catch (e) {
+        X.ui.toast(X.t('err.loginFail'), 'err');
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = X.t('auth.login'); }
+      }
     },
 
-    doRegister() {
+    async doRegister() {
       const username = X.utils.$('#rg_un').value.trim();
       const password = X.utils.$('#rg_pw').value;
       const confirm = X.utils.$('#rg_pw2').value;
       const phone = X.utils.$('#rg_phone').value.trim();
       const avatar = this.avatarType === 'dataurl' ? this.avatarDataUrl : this.pickedAvatar;
-      const r = X.auth.register({ username, password, confirm, phone, avatar, avatarType: this.avatarType });
-      if (!r.ok) { X.ui.toast(r.msg, 'err'); return; }
-      X.ui.toast(X.t('ok.registered'), 'ok');
-      X.ui.refresh();
-      X.router.go('home');
+      const btn = X.utils.$('#rg_btn');
+      if (btn) { btn.disabled = true; btn.textContent = '...'; }
+      try {
+        const r = await X.auth.register({ username, password, confirm, phone, avatar, avatarType: this.avatarType });
+        if (!r.ok) { X.ui.toast(r.msg, 'err'); return; }
+        X.ui.toast(X.t('ok.registered'), 'ok');
+        X.ui.refresh();
+        X.router.go('home');
+      } catch (e) {
+        X.ui.toast(X.t('err.loginFail'), 'err');
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = X.t('auth.register'); }
+      }
     }
   };
 

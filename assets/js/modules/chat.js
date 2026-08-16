@@ -1,6 +1,8 @@
 // ============================================================
-// Xiao · 模块 · 公共聊天大厅
+// Xiao · 模块 · 公共聊天大厅（Supabase Realtime）
 // @用户 / Emoji / 链接自动识别 / 用户交互（私聊/好友/举报）
+// 消息通过 Supabase Realtime 订阅 INSERT 事件实时推送；
+// 离开页面时 onLeave 清理订阅，避免泄漏。
 // ============================================================
 (function (X) {
   X.modules = X.modules || {};
@@ -10,8 +12,9 @@
   const MENTION_RE = /@([A-Za-z0-9_\u4e00-\u9fa5]{1,20})/g;
 
   const chat = {
-    lastLen: 0,
-    pollTimer: null,
+    sub: null,        // Realtime 订阅句柄
+    loaded: [],       // 已加载消息
+    loading: false,
 
     render() {
       if (!X.auth.requireLogin()) return;
@@ -22,9 +25,9 @@
             <div class="chat-main">
               <div class="chat-head">
                 <h3 style="margin:0">${t('chat.title')}</h3>
-                <span class="dim" style="font-size:12px" id="ch_stat"></span>
+                <span class="dim" style="font-size:12px" id="ch_stat">${X.supabaseReady ? '' : '⚠ Supabase 未配置'}</span>
               </div>
-              <div class="chat-body" id="ch_body"></div>
+              <div class="chat-body" id="ch_body"><div class="dim center" style="padding:20px">${t('common.loading') || '加载中...'}</div></div>
               <div class="chat-input">
                 <button class="icon-btn" id="ch_emoji" title="${t('chat.emoji')}">😊</button>
                 <textarea class="textarea" id="ch_input" data-i18n-ph="chat.placeholder" placeholder="${t('chat.placeholder')}" rows="1"></textarea>
@@ -32,52 +35,89 @@
               </div>
             </div>
             <div class="chat-side">
-              <div class="card"><div class="card-title">${t('chat.online')}</div><div id="ch_users"></div></div>
+              <div class="card"><div class="card-title">${t('chat.online')}</div><div id="ch_users"><div class="dim center" style="padding:10px">...</div></div></div>
             </div>
           </div>
         </section>`;
     },
 
-    afterRender() {
-      this.renderMessages();
+    async afterRender() {
+      await this.renderMessages();
       this.renderUsers();
-      X.utils.$('#ch_send').addEventListener('click', () => this.send());
-      X.utils.$('#ch_input').addEventListener('keydown', e => {
-        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); this.send(); }
-      });
-      X.utils.$('#ch_input').addEventListener('input', e => { e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px'; });
-      X.utils.$('#ch_emoji').addEventListener('click', () => this.toggleEmoji());
+      const sendBtn = X.utils.$('#ch_send');
+      if (sendBtn) sendBtn.addEventListener('click', () => this.send());
+      const input = X.utils.$('#ch_input');
+      if (input) {
+        input.addEventListener('keydown', e => {
+          if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); this.send(); }
+        });
+        input.addEventListener('input', e => { e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px'; });
+      }
+      const emojiBtn = X.utils.$('#ch_emoji');
+      if (emojiBtn) emojiBtn.addEventListener('click', () => this.toggleEmoji());
 
-      // 跨标签同步 + 定时轮询（本地模拟实时）
-      window.addEventListener('storage', e => { if (e.key === X.store.K.CHAT) this.renderMessages(); });
-      this.pollTimer = setInterval(() => this.renderMessages(true), 1500);
+      // Supabase Realtime：订阅大厅新消息
+      if (X.supabaseReady) {
+        this.sub = X.realtime.onInsert('messages', null, payload => {
+          const m = payload.new;
+          if (m && !this.loaded.find(x => x.id === m.id)) {
+            this.loaded.push(m);
+            this.appendMsg(m);
+          }
+        });
+      }
     },
 
-    /** 渲染消息（增量追加） */
-    renderMessages(appendOnly = false) {
+    /** 离开页面：清理 Realtime 订阅 */
+    onLeave() {
+      if (this.sub) { try { this.sub.unsubscribe(); } catch (e) {} this.sub = null; }
+      this.loaded = [];
+    },
+
+    /** 渲染全部消息（首次加载） */
+    async renderMessages() {
       const body = X.utils.$('#ch_body');
       if (!body) return;
-      const msgs = X.store.getChat();
-      if (appendOnly && msgs.length === this.lastLen) return;
+      if (!X.supabaseReady) {
+        body.innerHTML = '<div class="dim center" style="padding:20px">⚠ Supabase 未配置</div>';
+        return;
+      }
+      try {
+        this.loaded = await X.store.getChat(100);
+        body.innerHTML = '';
+        const cur = X.auth.currentUser();
+        this.loaded.forEach(m => body.appendChild(this.renderMsg(m, cur)));
+        body.scrollTop = body.scrollHeight;
+        const stat = X.utils.$('#ch_stat');
+        if (stat) stat.textContent = this.loaded.length + ' msgs';
+      } catch (e) {
+        body.innerHTML = '<div class="dim center" style="padding:20px">加载失败</div>';
+      }
+    },
+
+    /** 增量追加单条新消息 */
+    appendMsg(m) {
+      const body = X.utils.$('#ch_body');
+      if (!body) return;
       const cur = X.auth.currentUser();
-      body.innerHTML = '';
-      msgs.forEach(m => body.appendChild(this.renderMsg(m, cur)));
-      this.lastLen = msgs.length;
+      body.appendChild(this.renderMsg(m, cur));
       body.scrollTop = body.scrollHeight;
       const stat = X.utils.$('#ch_stat');
-      if (stat) stat.textContent = msgs.length + ' msgs';
+      if (stat) stat.textContent = this.loaded.length + ' msgs';
     },
 
     renderMsg(m, cur) {
-      const author = X.store.getUser(m.userId) || { username: '?', avatar: '❓', avatarType: 'emoji' };
-      const isMe = cur && m.userId === cur.id;
-      const avEl = author.avatarType === 'dataurl'
-        ? X.utils.h('img', { class: 'avatar sm clickable', src: author.avatar, onclick: () => this.openUser(author.id) })
-        : X.utils.h('span', { class: 'avatar sm clickable', style: { display: 'grid', placeItems: 'center', fontSize: '14px' }, onclick: () => this.openUser(author.id) }, [author.avatar]);
+      // 消息行自带作者快照（username/avatar/avatar_type），无需再次查询
+      const isMe = cur && m.user_id === cur.id;
+      const avatar = m.avatar || '❓';
+      const avatarType = m.avatar_type || 'emoji';
+      const avEl = avatarType === 'dataurl'
+        ? X.utils.h('img', { class: 'avatar sm clickable', src: avatar, onclick: () => this.openUser(m.user_id) })
+        : X.utils.h('span', { class: 'avatar sm clickable', style: { display: 'grid', placeItems: 'center', fontSize: '14px' }, onclick: () => this.openUser(m.user_id) }, [avatar]);
       const meta = X.utils.h('div', { class: 'meta-col' });
-      const name = X.utils.h('div', { class: 'name' }, [author.username + (author.role === 'super' || author.role === 'admin' ? ' ✦' : '') + ' · ' + X.utils.relTime(m.ts)]);
+      const name = X.utils.h('div', { class: 'name' }, [(m.username || '?') + ' · ' + X.utils.relTime(m.created_at)]);
       const bubble = X.utils.h('div', { class: 'bubble' + (isMe ? ' me' : '') });
-      bubble.innerHTML = this.format(m.text);
+      bubble.innerHTML = this.format(m.text || '');
       meta.appendChild(name); meta.appendChild(bubble);
       const row = X.utils.h('div', { class: 'msg' + (isMe ? ' me' : '') }, [avEl, meta]);
       return row;
@@ -91,16 +131,28 @@
       return s;
     },
 
-    send() {
+    async send() {
       if (!X.auth.requireLogin()) return;
       const cur = X.auth.currentUser();
       if (X.auth.isMuted(cur)) { X.ui.toast(X.t('err.noPerm'), 'err'); return; }
       const input = X.utils.$('#ch_input');
       const text = input.value.trim();
       if (!text) return;
-      X.store.addMessage({ userId: cur.id, text });
-      input.value = ''; input.style.height = 'auto';
-      this.renderMessages();
+      const btn = X.utils.$('#ch_send');
+      if (btn) { btn.disabled = true; }
+      try {
+        await X.store.addMessage({
+          userId: cur.id, username: cur.username, avatar: cur.avatar, avatarType: cur.avatar_type, text
+        });
+        // Realtime 会推送，无需手动 append；但为兼容未启用 Realtime 的情况兜底
+        if (!this.sub) { await this.renderMessages(); }
+      } catch (e) {
+        X.ui.toast('发送失败', 'err');
+      } finally {
+        input.value = ''; input.style.height = 'auto';
+        if (btn) btn.disabled = false;
+        input.focus();
+      }
     },
 
     /** Emoji 面板 */
@@ -119,23 +171,28 @@
     },
 
     /** 在线用户列表 */
-    renderUsers() {
+    async renderUsers() {
       const box = X.utils.$('#ch_users');
       if (!box) return;
-      const users = X.store.getUsers();
-      const cur = X.auth.currentUser();
-      box.innerHTML = '';
-      users.slice(0, 30).forEach(u => {
-        const av = u.avatarType === 'dataurl'
-          ? X.utils.h('img', { class: 'avatar sm', src: u.avatar })
-          : X.utils.h('span', { class: 'avatar sm', style: { display: 'grid', placeItems: 'center', fontSize: '14px' } }, [u.avatar]);
-        const online = Math.random() > 0.5; // 演示
-        const row = X.utils.h('div', { class: 'user-online' + (online ? '' : ' off'), onclick: () => this.openUser(u.id) }, [
-          X.utils.h('span', { class: 'dot' }), av,
-          X.utils.h('span', { class: 's' }, [u.username + (u.id === cur.id ? ' (me)' : '')])
-        ]);
-        box.appendChild(row);
-      });
+      if (!X.supabaseReady) { box.innerHTML = '<div class="dim center">未配置</div>'; return; }
+      try {
+        const users = await X.store.getUsers();
+        const cur = X.auth.currentUser();
+        box.innerHTML = '';
+        users.slice(0, 30).forEach(u => {
+          const av = u.avatar_type === 'dataurl'
+            ? X.utils.h('img', { class: 'avatar sm', src: u.avatar })
+            : X.utils.h('span', { class: 'avatar sm', style: { display: 'grid', placeItems: 'center', fontSize: '14px' } }, [u.avatar]);
+          const online = Math.random() > 0.5; // 演示在线状态
+          const row = X.utils.h('div', { class: 'user-online' + (online ? '' : ' off'), onclick: () => this.openUser(u.id) }, [
+            X.utils.h('span', { class: 'dot' }), av,
+            X.utils.h('span', { class: 's' }, [u.username + (cur && u.id === cur.id ? ' (me)' : '')])
+          ]);
+          box.appendChild(row);
+        });
+      } catch (e) {
+        box.innerHTML = '<div class="dim center">加载失败</div>';
+      }
     },
 
     /** 点击用户 → 详情弹窗：发起私聊 / 好友申请 / 举报 */
@@ -145,5 +202,9 @@
   };
 
   X.modules.chat = chat;
-  X.router.register('chat', { render: () => chat.render(), afterRender: () => chat.afterRender() });
+  X.router.register('chat', {
+    render: () => chat.render(),
+    afterRender: () => chat.afterRender(),
+    onLeave: () => chat.onLeave()
+  });
 })(window.Xiao = window.Xiao || {});
