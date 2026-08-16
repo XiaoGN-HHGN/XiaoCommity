@@ -12,6 +12,34 @@
   const SESSION_TEMP_ADMIN = 'xiao.tempAdmin';
   const REMEMBER_KEY = 'xiao.remember';
 
+  /**
+   * 【Fix: invalid email format】
+   * Supabase Auth 严格要求 RFC 5322 邮箱格式，用户名含中文/空格/特殊字符时
+   * `${username}@xiao.local` 会被直接 400。
+   * 这里对用户名做稳定转义：ASCII 字母数字保留，其余字符 -> `__u{codepoint}` 或 %xx 形式。
+   * 关键：同一个用户名必须稳定生成同一个邮箱 local-part（保证注册/登录对得上）。
+   */
+  function _encodeUsername(u) {
+    if (!u) return 'empty';
+    const s = String(u).trim();
+    let out = '';
+    // 优先走 encodeURIComponent 但把 % 换成 _，@ 符号必须被转义否则邮箱格式非法
+    const encoded = encodeURIComponent(s).replace(/%/g, '_').replace(/\./g, '_d').replace(/@/g, '_at_');
+    // 再加前缀 u_ 防止以数字/特殊字符开头（. _ 开头也不合规）
+    out = 'u_' + encoded;
+    // RFC 5322 local-part 限制 64 字节，过长就裁掉加 hash 后缀保证不冲突
+    if (out.length > 60) {
+      let h = 0; for (let i = 0; i < out.length; i++) h = ((h << 5) - h + out.charCodeAt(i)) | 0;
+      out = out.slice(0, 50) + '_h' + Math.abs(h).toString(36);
+    }
+    return out;
+  }
+
+  /** 注册/登录都走同一条合成邮箱逻辑 */
+  function _userEmail(username) {
+    return `${_encodeUsername(username)}@${X.SUPABASE_CONFIG.EMAIL_DOMAIN}`;
+  }
+
   const auth = {
     REDEEM_CODE,
     _profile: null,   // 同步缓存当前用户 profile
@@ -56,7 +84,7 @@
       // 2) Supabase Auth 的 email 唯一性本身就能兜底（重复用户名=重复 email → signUp 直接报错 "already registered"）
       //    等用户登录后再预检也不迟。
 
-      const email = `${username}@${X.SUPABASE_CONFIG.EMAIL_DOMAIN}`;
+      const email = _userEmail(username);
       // 带 rawUserMeta，保证 trigger handle_new_user 就算列名对不上，前端也能拿到 username/phone 兜底写
       const { data, error } = await X.db.auth.signUp({
         email,
@@ -104,7 +132,7 @@
     /** 登录：合成邮箱 + 密码；remember 缓存凭据用于下次预填 */
     async login(username, password, remember) {
       if (!X.supabaseReady) return { ok: false, msg: 'Supabase 未配置' };
-      const email = `${username}@${X.SUPABASE_CONFIG.EMAIL_DOMAIN}`;
+      const email = _userEmail(username);
       const { data, error } = await X.db.auth.signInWithPassword({ email, password });
       if (error || !data.user) {
         // [FIX] 暴露 Supabase 真实错误信息，便于定位 400 根因（如 Email not confirmed）

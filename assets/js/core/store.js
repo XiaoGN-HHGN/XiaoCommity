@@ -299,19 +299,34 @@
     });
   }
 
-  /** [前端 → DB] 举报写入 reports */
+  /** 宽松 UUID 校验（36 字符带横杠 / 32 字符不带横杠） */
+  const _uuidRe = /^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$/;
+
+  /** [前端 → DB] 举报写入 reports（你表的 target_id 是 UUID 类型，非 UUID 必须降级，否则 Postgres 报 400） */
   function _repOut(fe) {
-    return {
-      reporter_id: fe.reporter_id,
-      target_type: fe.target_type || '',
-      target_id:   fe.target_id ? String(fe.target_id) : null,
-      reason:      fe.reason || '',
+    const rawTid = fe.target_id;
+    let targetId = null;
+    let reasonExtra = '';
+    if (rawTid != null && rawTid !== '') {
+      const t = String(rawTid);
+      if (_uuidRe.test(t)) { targetId = t; }
+      // 非 UUID（比如作品 bigint id、消息纯数字 id）：塞进 reason 前缀里保留，target_id 置 null 避免 400
+      else { reasonExtra = ' [target_id=' + t + ']'; }
+    }
+    const row = {
+      reporter_id:   fe.reporter_id,
+      target_type:   fe.target_type || '',
+      target_id:     targetId,
+      reason:        (fe.reason || '') + reasonExtra,
       handle_status: fe.status || fe.handle_status || 'pending',
-      action:      fe.action || '',
-      note:        fe.note || '',
-      resolved_at: fe.resolved_at || null,
-      created_at:  fe.created_at || new Date().toISOString()
+      created_at:    fe.created_at || new Date().toISOString()
     };
+    // 下面三列在"补列 SQL"执行完才存在；没补的话，PostgREST 会忽略未知列吗？不，会 42703。
+    // 所以先尝试只写基础列，失败时再带扩展列重试。由调用方 insert 决定走哪条路径。
+    if (fe.action !== undefined) row.action = fe.action || null;
+    if (fe.note !== undefined)   row.note   = fe.note   || null;
+    if (fe.resolved_at)          row.resolved_at = fe.resolved_at;
+    return row;
   }
 
   const store = {
@@ -369,33 +384,33 @@
 
     /**
      * 调整代币：正增负减。
-     * 【兼容 fallback】：你没建 adjust_coin RPC 时，直接 UPDATE profiles.balance。
-     * 两种方式都走不通时返回 null（页面静默降级）。
+     * 优先走 DB 函数 adjust_coin（原子、支持并发安全），不存在时回退前端 SELECT+UPDATE balance。
+     * 两种路径失败都**不打 warn 刷屏**，调试看输出可在控制台执行 window.XIAO_DEBUG = true 再操作。
      */
     async adjustCoin(userId, delta) {
       if (!userId) return null;
       const d = Number(delta) || 0;
       if (!d) return null;
-      // 方式 1：走 RPC（如果有）
+      // 方式 1：走 RPC（原子操作，推荐。建表 SQL 见交付 SQL 片段）
       try {
         const r = await X.dbq.rpc('adjust_coin', { target: userId, delta: d });
         if (r != null) return r;
-      } catch (_) {}
-      // 方式 2：直接 UPDATE 你自己的 profiles.balance 列
+      } catch (e) {
+        if (window.XIAO_DEBUG) console.debug('[Xiao] adjust_coin rpc fail (fallback to direct update)', e && e.message);
+      }
+      // 方式 2：直接 UPDATE 你表的 balance/ttpx_a 列
       try {
-        // 先读当前余额再加（避免 "column does not exist" 报错时静默）
         const u = await X.dbq.select(T.PROFILES, { eq: ['id', userId], single: true });
         if (!u) return null;
         const cur = Number(u.balance) || Number(u.ttpx_a) || 0;
         const next = +(cur + d).toFixed(2);
-        // 写你自己表的列（balance），同时保持 SETUP.md 列（ttpx_a）以防万一
         const patch = {};
         if ('balance' in u) patch.balance = next;
         if ('ttpx_a' in u) patch.ttpx_a = next;
         await X.dbq.update(T.PROFILES, patch, { eq: ['id', userId] });
         return next;
       } catch (e) {
-        console.warn('adjustCoin fallback fail', e);
+        if (window.XIAO_DEBUG) console.debug('[Xiao] adjustCoin direct fail', e && e.message);
         return null;
       }
     },
@@ -694,31 +709,53 @@
       return _repIn(r);
     },
     async resolveReport(id, action, note) {
+      const now = new Date().toISOString();
+      // 先尝试带扩展三列（action/note/resolved_at）更新——前提是你补了列的 SQL 已执行
       try {
         await X.dbq.update(T.REPORTS, {
           handle_status: 'resolved',
           action: action || '',
           note: note || '',
-          resolved_at: new Date().toISOString()
+          resolved_at: now
         }, { eq: ['id', id] });
+        return;
+      } catch (_) {}
+      // 扩展列不存在：退化成只更新 handle_status，管理员审核标记不丢失
+      try {
+        await X.dbq.update(T.REPORTS, { handle_status: 'resolved' }, { eq: ['id', id] });
       } catch (_) {}
     },
 
-    // ===== 管理员日志：你未建 admin_logs，降级为空操作（不抛错） =====
-    async getLogs(limit = 200) { return []; },
-    async addLog(_meta) {
-      // 可选：写进 reports 表加个特殊 target_type 占位，方便排查。
+    // ===== 管理员日志（admin_logs 表已创建）=====
+    async getLogs(limit = 200) {
       try {
-        await X.dbq.insert(T.REPORTS, _repOut({
-          reporter_id: _meta && _meta.operatorId,
-          target_type: 'admin_log',
-          target_id: _meta && _meta.targetUserId,
-          reason: (_meta && _meta.reason) || (_meta && _meta.action) || '',
-          status: 'resolved',
-          action: (_meta && _meta.action) || ''
+        const rows = await X.dbq.select('admin_logs', { order: ['created_at', { ascending: false }], limit });
+        return (rows || []).map(r => ({
+          id: r.id,
+          operator_id: r.operator_id,
+          action: r.action || '',
+          target_user_id: r.target_user_id,
+          reason: r.reason || '',
+          meta: r.meta || null,
+          created_at: r.created_at
         }));
-      } catch (_) {}
-      return null;
+      } catch (_) { return []; }
+    },
+    async addLog({ operatorId, action, targetUserId, reason, meta }) {
+      try {
+        return await X.dbq.insert('admin_logs', {
+          operator_id: operatorId || null,
+          action: action || '',
+          target_user_id: targetUserId || null,
+          reason: reason || null,
+          meta: meta || null,
+          created_at: new Date().toISOString()
+        });
+      } catch (e) {
+        // admin_logs 写失败（极端情况：RLS/列缺），静默降级不抛错，管理员操作流程不被打断
+        if (window.XIAO_DEBUG) console.debug('[Xiao] addLog fail →', e && e.message);
+        return null;
+      }
     }
   };
 
