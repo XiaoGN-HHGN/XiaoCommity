@@ -438,10 +438,12 @@
         if (senderIds.size > 0) {
           try {
             // Supabase-js v2 直接连 client 发 `in` 查询，绕过 dbq 没封装 in() 的问题
+            // 【Fix】profiles 表只保证有 avatar_url，没有 avatar/avatar_type 列；
+            //       只 select 真实存在的列，避免 42703 → HTTP 400
             const ids = Array.from(senderIds);
             const { data, error } = await X.db
               .from(T.PROFILES)
-              .select('id,username,avatar,avatar_url,avatar_type')
+              .select('id,username,avatar_url')
               .in('id', ids);
             if (!error && Array.isArray(data)) {
               const map = {};
@@ -450,9 +452,11 @@
                 const sid = r.sender_id || r.user_id;
                 const p = map[sid];
                 if (p && !r.username) {
-                  r.username    = p.username || '';
-                  r.avatar      = p.avatar || p.avatar_url || '';
-                  r.avatar_type = p.avatar_type || (r.avatar && r.avatar.startsWith && r.avatar.startsWith('data:') ? 'dataurl' : 'emoji');
+                  r.username = p.username || '';
+                  // avatar_url 同时充当 avatar 字段；type 根据 data: 前缀探测
+                  const av = p.avatar_url || p.avatar || '';
+                  r.avatar      = av;
+                  r.avatar_type = (av && av.indexOf && av.indexOf('data:') === 0) ? 'dataurl' : 'emoji';
                 }
               });
             }
